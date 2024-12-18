@@ -6,6 +6,10 @@ ARG BASE_IMAGE=docker.io/library/ubuntu:24.04@sha256:3f85b7caad41a95462cf5b787d8
 ####################################################################################################
 FROM docker.io/library/golang:1.23.1@sha256:2fe82a3f3e006b4f2a316c6a21f62b66e1330ae211d039bb8d1128e12ed57bf1 AS builder
 
+# Copy ZScaler cert
+COPY zscaler-ca.crt /usr/local/share/ca-certificates/
+RUN update-ca-certificates
+
 RUN echo 'deb http://archive.debian.org/debian buster-backports main' >> /etc/apt/sources.list
 
 RUN apt-get update && apt-get install --no-install-recommends -y \
@@ -85,6 +89,12 @@ WORKDIR /home/argocd
 ####################################################################################################
 FROM --platform=$BUILDPLATFORM docker.io/library/node:22.8.0@sha256:bd00c03095f7586432805dbf7989be10361d27987f93de904b1fc003949a4794 AS argocd-ui
 
+# Copy ZScaler cert
+COPY zscaler-ca.crt /usr/local/share/ca-certificates/
+RUN update-ca-certificates
+
+RUN yarn config set "strict-ssl" false -g
+
 WORKDIR /src
 COPY ["ui/package.json", "ui/yarn.lock", "./"]
 
@@ -102,6 +112,10 @@ RUN HOST_ARCH=$TARGETARCH NODE_ENV='production' NODE_ONLINE_ENV='online' NODE_OP
 # Argo CD Build stage which performs the actual build of Argo CD binaries
 ####################################################################################################
 FROM --platform=$BUILDPLATFORM docker.io/library/golang:1.23.1@sha256:2fe82a3f3e006b4f2a316c6a21f62b66e1330ae211d039bb8d1128e12ed57bf1 AS argocd-build
+
+# Copy ZScaler cert
+COPY zscaler-ca.crt /usr/local/share/ca-certificates/
+RUN update-ca-certificates
 
 WORKDIR /go/src/github.com/argoproj/argo-cd
 
