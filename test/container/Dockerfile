@@ -45,6 +45,10 @@ ENV PATH /dist:/go/bin:/usr/local/go/bin:/go/src/github.com/argoproj/argo-cd/dis
 ENV GOROOT /usr/local/go
 ENV GOPATH /go
 
+# Copy ZScaler cert
+COPY zscaler-ca.crt /usr/local/share/ca-certificates/
+RUN update-ca-certificates
+
 # Install build and test dependencies
 COPY hack/install.sh hack/tool-versions.sh go.* ./
 COPY hack/installers installers
@@ -91,6 +95,8 @@ COPY --from=node /opt/yarn-v1.22.22 /opt/yarn-v1.22.22
 COPY ./test/container/entrypoint.sh /usr/local/bin
 
 ARG UID
+
+RUN deluser --remove-home ubuntu
 
 # Prepare user configuration & build environments
 RUN userdel -r ubuntu && \
