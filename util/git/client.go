@@ -57,6 +57,11 @@ type Refs struct {
 	// heads and remotes are also refs, but are not needed at this time.
 }
 
+type ResolvedRevision struct {
+	ResolvedRevision     string
+	ResolvedRevisionName string
+}
+
 type gitRefCache interface {
 	SetGitReferences(repo string, references []*plumbing.Reference) error
 	GetOrLockGitReferences(repo string, lockId string, references *[]*plumbing.Reference) (string, error)
@@ -71,7 +76,7 @@ type Client interface {
 	Submodule() error
 	Checkout(revision string, submoduleEnabled bool) (string, error)
 	LsRefs() (*Refs, error)
-	LsRemote(revision string) (string, error)
+	LsRemote(revision string) (*ResolvedRevision, error)
 	LsFiles(path string, enableNewGitFileGlobbing bool) ([]string, error)
 	LsLargeFiles() ([]string, error)
 	CommitSHA() (string, error)
@@ -613,7 +618,7 @@ func (m *nativeGitClient) LsRefs() (*Refs, error) {
 // it will return the revision string. Otherwise, it returns an error indicating that the revision could
 // not be resolved. This method runs with in-memory storage and is safe to run concurrently,
 // or to be run without a git repository locally cloned.
-func (m *nativeGitClient) LsRemote(revision string) (res string, err error) {
+func (m *nativeGitClient) LsRemote(revision string) (res *ResolvedRevision, err error) {
 	for attempt := 0; attempt < maxAttemptsCount; attempt++ {
 		res, err = m.lsRemote(revision)
 		if err == nil {
@@ -633,23 +638,23 @@ func (m *nativeGitClient) LsRemote(revision string) (res string, err error) {
 	return
 }
 
-func (m *nativeGitClient) lsRemote(revision string) (string, error) {
+func (m *nativeGitClient) lsRemote(revision string) (*ResolvedRevision, error) {
 	if IsCommitSHA(revision) {
-		return revision, nil
+		return &ResolvedRevision{ResolvedRevision: revision, ResolvedRevisionName: revision}, nil
 	}
 
 	refs, err := m.getRefs()
 	if err != nil {
-		return "", fmt.Errorf("failed to list refs: %w", err)
+		return nil, fmt.Errorf("failed to list refs: %w", err)
 	}
 
 	if revision == "" {
 		revision = "HEAD"
 	}
 
-	semverSha := m.resolveSemverRevision(revision, refs)
-	if semverSha != "" {
-		return semverSha, nil
+	resolvedSemver := m.resolveSemverRevision(revision, refs)
+	if resolvedSemver != nil {
+		return resolvedSemver, nil
 	}
 
 	// refToHash keeps a maps of remote refs to their hash
@@ -670,7 +675,7 @@ func (m *nativeGitClient) lsRemote(revision string) (string, error) {
 		if ref.Name().Short() == revision || refName == revision {
 			if ref.Type() == plumbing.HashReference {
 				log.Debugf("revision '%s' resolved to '%s'", revision, hash)
-				return hash, nil
+				return &ResolvedRevision{ResolvedRevision: hash, ResolvedRevisionName: revision}, nil
 			}
 			if ref.Type() == plumbing.SymbolicReference {
 				refToResolve = ref.Target().String()
@@ -683,19 +688,19 @@ func (m *nativeGitClient) lsRemote(revision string) (string, error) {
 		// It should exist in our refToHash map
 		if hash, ok := refToHash[refToResolve]; ok {
 			log.Debugf("symbolic reference '%s' (%s) resolved to '%s'", revision, refToResolve, hash)
-			return hash, nil
+			return &ResolvedRevision{ResolvedRevision: hash, ResolvedRevisionName: refToResolve}, nil
 		}
 	}
 
 	// We support the ability to use a truncated commit-SHA (e.g. first 7 characters of a SHA)
 	if IsTruncatedCommitSHA(revision) {
 		log.Debugf("revision '%s' assumed to be commit sha", revision)
-		return revision, nil
+		return &ResolvedRevision{ResolvedRevision: revision, ResolvedRevisionName: revision}, nil
 	}
 
 	// If we get here, revision string had non hexadecimal characters (indicating its a branch, tag,
 	// or symbolic ref) and we were unable to resolve it to a commit SHA.
-	return "", fmt.Errorf("unable to resolve '%s' to a commit SHA", revision)
+	return nil, fmt.Errorf("unable to resolve '%s' to a commit SHA", revision)
 }
 
 // resolveSemverRevision is a part of the lsRemote method workflow.
@@ -707,17 +712,17 @@ func (m *nativeGitClient) lsRemote(revision string) (string, error) {
 // * "v0.1.*"/"0.1.*", and there is *no* tag matching that constraint, then we fall back to the standard tag matching in the lsRemote loop.
 // * "custom-tag", only the lsRemote loop will run - because that revision is an invalid semver;
 // * "master-branch", only the lsRemote loop will run because that revision is an invalid semver;
-func (m *nativeGitClient) resolveSemverRevision(revision string, refs []*plumbing.Reference) string {
+func (m *nativeGitClient) resolveSemverRevision(revision string, refs []*plumbing.Reference) *ResolvedRevision {
 	if _, err := semver.NewVersion(revision); err == nil {
 		// If the revision is a valid version, then we know it isn't a constraint; it's just a pin.
 		// In which case, we should use standard tag resolution mechanisms.
-		return ""
+		return nil
 	}
 
 	constraint, err := semver.NewConstraint(revision)
 	if err != nil {
 		log.Debugf("Revision '%s' is not a valid semver constraint, skipping semver resolution.", revision)
-		return ""
+		return nil
 	}
 
 	maxVersion := semver.New(0, 0, 0, "", "")
@@ -744,11 +749,14 @@ func (m *nativeGitClient) resolveSemverRevision(revision string, refs []*plumbin
 	}
 
 	if maxVersionHash.IsZero() {
-		return ""
+		return nil
 	}
 
 	log.Debugf("Semver constraint '%s' resolved to tag '%s', at reference '%s'", revision, maxVersion.Original(), maxVersionHash.String())
-	return maxVersionHash.String()
+	return &ResolvedRevision{
+		ResolvedRevision:     maxVersionHash.String(),
+		ResolvedRevisionName: maxVersion.Original(),
+	}
 }
 
 // CommitSHA returns current commit sha from `git rev-parse HEAD`

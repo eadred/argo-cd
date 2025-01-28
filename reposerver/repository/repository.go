@@ -206,10 +206,11 @@ func (s *Service) ListRefs(_ context.Context, q *apiclient.ListRefsRequest) (*ap
 
 // ListApps lists the contents of a GitHub repo
 func (s *Service) ListApps(ctx context.Context, q *apiclient.ListAppsRequest) (*apiclient.AppList, error) {
-	gitClient, commitSHA, err := s.newClientResolveRevision(q.Repo, q.Revision)
+	gitClient, resolvedRevision, err := s.newClientResolveRevision(q.Repo, q.Revision)
 	if err != nil {
 		return nil, fmt.Errorf("error setting up git client and resolving given revision: %w", err)
 	}
+	commitSHA := resolvedRevision.ResolvedRevision
 	if apps, err := s.cache.ListApps(q.Repo.Repo, commitSHA); err == nil {
 		log.Infof("cache hit: %s/%s", q.Repo.Repo, q.Revision)
 		return &apiclient.AppList{Apps: apps}, nil
@@ -292,7 +293,7 @@ func (s *Service) runRepoOperation(
 	source *v1alpha1.ApplicationSource,
 	verifyCommit bool,
 	cacheFn func(cacheKey string, refSourceCommitSHAs cache.ResolvedRevisions, firstInvocation bool) (bool, error),
-	operation func(repoRoot, commitSHA, cacheKey string, ctxSrc operationContextSrc) error,
+	operation func(repoRoot string, resolvedRevision *git.ResolvedRevision, cacheKey string, ctxSrc operationContextSrc) error,
 	settings operationSettings,
 	hasMultipleSources bool,
 	refSources map[string]*v1alpha1.RefTarget,
@@ -307,14 +308,16 @@ func (s *Service) runRepoOperation(
 	var err error
 	gitClientOpts := git.WithCache(s.cache, !settings.noRevisionCache && !settings.noCache)
 	revision = textutils.FirstNonEmpty(revision, source.TargetRevision)
-	unresolvedRevision := revision
+	var resolvedRevision *git.ResolvedRevision
 	if source.IsHelm() {
-		helmClient, revision, err = s.newHelmClientResolveRevision(repo, revision, source.Chart, settings.noCache || settings.noRevisionCache)
+		var helmResolvedRevision string
+		helmClient, helmResolvedRevision, err = s.newHelmClientResolveRevision(repo, revision, source.Chart, settings.noCache || settings.noRevisionCache)
 		if err != nil {
 			return err
 		}
+		resolvedRevision = &git.ResolvedRevision{ResolvedRevision: helmResolvedRevision, ResolvedRevisionName: helmResolvedRevision}
 	} else {
-		gitClient, revision, err = s.newClientResolveRevision(repo, revision, gitClientOpts)
+		gitClient, resolvedRevision, err = s.newClientResolveRevision(repo, revision, gitClientOpts)
 		if err != nil {
 			return err
 		}
@@ -326,7 +329,7 @@ func (s *Service) runRepoOperation(
 	}
 
 	if !settings.noCache {
-		if ok, err := cacheFn(revision, repoRefs, true); ok {
+		if ok, err := cacheFn(resolvedRevision.ResolvedRevision, repoRefs, true); ok {
 			return err
 		}
 	}
@@ -344,7 +347,7 @@ func (s *Service) runRepoOperation(
 
 	if source.IsHelm() {
 		if settings.noCache {
-			err = helmClient.CleanChartCache(source.Chart, revision, repo.Project)
+			err = helmClient.CleanChartCache(source.Chart, resolvedRevision.ResolvedRevision, repo.Project)
 			if err != nil {
 				return err
 			}
@@ -353,7 +356,7 @@ func (s *Service) runRepoOperation(
 		if source.Helm != nil {
 			helmPassCredentials = source.Helm.PassCredentials
 		}
-		chartPath, closer, err := helmClient.ExtractChart(source.Chart, revision, repo.Project, helmPassCredentials, s.initConstants.HelmManifestMaxExtractedSize, s.initConstants.DisableHelmManifestMaxExtractedSize)
+		chartPath, closer, err := helmClient.ExtractChart(source.Chart, resolvedRevision.ResolvedRevision, repo.Project, helmPassCredentials, s.initConstants.HelmManifestMaxExtractedSize, s.initConstants.DisableHelmManifestMaxExtractedSize)
 		if err != nil {
 			return err
 		}
@@ -366,7 +369,7 @@ func (s *Service) runRepoOperation(
 					log.WithFields(log.Fields{
 						common.SecurityField: common.SecurityHigh,
 						"chart":              source.Chart,
-						"revision":           revision,
+						"revision":           resolvedRevision.ResolvedRevision,
 						"file":               oobError.File,
 					}).Warn("chart contains out-of-bounds symlink")
 					return fmt.Errorf("chart contains out-of-bounds symlinks. file: %s", oobError.File)
@@ -374,12 +377,12 @@ func (s *Service) runRepoOperation(
 				return err
 			}
 		}
-		return operation(chartPath, revision, revision, func() (*operationContext, error) {
+		return operation(chartPath, resolvedRevision, resolvedRevision.ResolvedRevision, func() (*operationContext, error) {
 			return &operationContext{chartPath, ""}, nil
 		})
 	}
-	closer, err := s.repoLock.Lock(gitClient.Root(), revision, settings.allowConcurrent, func() (goio.Closer, error) {
-		return s.checkoutRevision(gitClient, revision, s.initConstants.SubmoduleEnabled)
+	closer, err := s.repoLock.Lock(gitClient.Root(), resolvedRevision.ResolvedRevision, settings.allowConcurrent, func() (goio.Closer, error) {
+		return s.checkoutRevision(gitClient, resolvedRevision.ResolvedRevision, s.initConstants.SubmoduleEnabled)
 	})
 	if err != nil {
 		return err
@@ -395,7 +398,7 @@ func (s *Service) runRepoOperation(
 				log.WithFields(log.Fields{
 					common.SecurityField: common.SecurityHigh,
 					"repo":               repo.Repo,
-					"revision":           revision,
+					"revision":           resolvedRevision.ResolvedRevision,
 					"file":               oobError.File,
 				}).Warn("repository contains out-of-bounds symlink")
 				return fmt.Errorf("repository contains out-of-bounds symlinks. file: %s", oobError.File)
@@ -404,37 +407,38 @@ func (s *Service) runRepoOperation(
 		}
 	}
 
-	var commitSHA string
+	var operationRevision *git.ResolvedRevision
 	if hasMultipleSources {
-		commitSHA = revision
+		operationRevision = resolvedRevision
 	} else {
 		commit, err := gitClient.CommitSHA()
 		if err != nil {
 			return fmt.Errorf("failed to get commit SHA: %w", err)
 		}
-		commitSHA = commit
+		operationRevision = &git.ResolvedRevision{ResolvedRevision: commit, ResolvedRevisionName: commit}
 	}
 
 	// double-check locking
 	if !settings.noCache {
-		if ok, err := cacheFn(revision, repoRefs, false); ok {
+		if ok, err := cacheFn(resolvedRevision.ResolvedRevision, repoRefs, false); ok {
 			return err
 		}
 	}
 
+	// eabi-TODO Update this comment
 	// Here commitSHA refers to the SHA of the actual commit, whereas revision refers to the branch/tag name etc
 	// We use the commitSHA to generate manifests and store them in cache, and revision to retrieve them from cache
-	return operation(gitClient.Root(), commitSHA, revision, func() (*operationContext, error) {
+	return operation(gitClient.Root(), operationRevision, resolvedRevision.ResolvedRevision, func() (*operationContext, error) {
 		var signature string
 		if verifyCommit {
 			// When the revision is an annotated tag, we need to pass the unresolved revision (i.e. the tag name)
 			// to the verification routine. For everything else, we work with the SHA that the target revision is
 			// pointing to (i.e. the resolved revision).
 			var rev string
-			if gitClient.IsAnnotatedTag(revision) {
-				rev = unresolvedRevision
+			if gitClient.IsAnnotatedTag(resolvedRevision.ResolvedRevision) {
+				rev = resolvedRevision.ResolvedRevisionName
 			} else {
-				rev = revision
+				rev = resolvedRevision.ResolvedRevision
 			}
 			signature, err = gitClient.VerifyCommitSignature(rev)
 			if err != nil {
@@ -458,7 +462,7 @@ func getRepoSanitizerRegex(rootDir string) *regexp.Regexp {
 	return regexp.MustCompile(regexp.QuoteMeta(rootDir) + `/[^ /]*`)
 }
 
-type gitClientGetter func(repo *v1alpha1.Repository, revision string, opts ...git.ClientOpts) (git.Client, string, error)
+type gitClientGetter func(repo *v1alpha1.Repository, revision string, opts ...git.ClientOpts) (git.Client, *git.ResolvedRevision, error)
 
 // resolveReferencedSources resolves the revisions for the given referenced sources. This lets us invalidate the cached
 // when one or more referenced sources change.
@@ -498,13 +502,13 @@ func resolveReferencedSources(hasMultipleSources bool, source *v1alpha1.Applicat
 			normalizedRepoURL := git.NormalizeGitURL(refSourceMapping.Repo.Repo)
 			_, ok = repoRefs[normalizedRepoURL]
 			if !ok {
-				_, referencedCommitSHA, err := newClientResolveRevision(&refSourceMapping.Repo, refSourceMapping.TargetRevision, gitClientOpts)
+				_, resolvedRevision, err := newClientResolveRevision(&refSourceMapping.Repo, refSourceMapping.TargetRevision, gitClientOpts)
 				if err != nil {
 					log.Errorf("Failed to get git client for repo %s: %v", refSourceMapping.Repo.Repo, err)
 					return nil, fmt.Errorf("failed to get git client for repo %s", refSourceMapping.Repo.Repo)
 				}
 
-				repoRefs[normalizedRepoURL] = referencedCommitSHA
+				repoRefs[normalizedRepoURL] = resolvedRevision.ResolvedRevision
 			}
 		}
 	}
@@ -520,7 +524,7 @@ func (s *Service) GenerateManifest(ctx context.Context, q *apiclient.ManifestReq
 		log.Debugf("Skipping manifest generation for ref only source for application: %s and ref %s", q.AppName, q.ApplicationSource.Ref)
 		_, revision, err := s.newClientResolveRevision(q.Repo, q.Revision, git.WithCache(s.cache, !q.NoRevisionCache && !q.NoCache))
 		res = &apiclient.ManifestResponse{
-			Revision: revision,
+			Revision: revision.ResolvedRevision,
 		}
 		return res, err
 	}
@@ -534,19 +538,19 @@ func (s *Service) GenerateManifest(ctx context.Context, q *apiclient.ManifestReq
 	tarConcluded := false
 	var promise *ManifestResponsePromise
 
-	operation := func(repoRoot, commitSHA, cacheKey string, ctxSrc operationContextSrc) error {
+	operation := func(repoRoot string, resolvedRevision *git.ResolvedRevision, cacheKey string, ctxSrc operationContextSrc) error {
 		// do not generate manifests if Path and Chart fields are not set for a source in Multiple Sources
 		if q.HasMultipleSources && q.ApplicationSource.Path == "" && q.ApplicationSource.Chart == "" {
 			log.WithFields(map[string]any{
 				"source": q.ApplicationSource,
 			}).Debugf("not generating manifests as path and chart fields are empty")
 			res = &apiclient.ManifestResponse{
-				Revision: commitSHA,
+				Revision: resolvedRevision.ResolvedRevision,
 			}
 			return nil
 		}
 
-		promise = s.runManifestGen(ctx, repoRoot, commitSHA, cacheKey, ctxSrc, q)
+		promise = s.runManifestGen(ctx, repoRoot, resolvedRevision, cacheKey, ctxSrc, q)
 		// The fist channel to send the message will resume this operation.
 		// The main purpose for using channels here is to be able to unlock
 		// the repository as soon as the lock in not required anymore. In
@@ -614,7 +618,8 @@ func (s *Service) GenerateManifestWithFiles(stream apiclient.RepoServerService_G
 		}
 	}
 
-	promise := s.runManifestGen(stream.Context(), workDir, "streamed", metadata.Checksum, func() (*operationContext, error) {
+	resolvedRevision := &git.ResolvedRevision{ResolvedRevision: "streamed", ResolvedRevisionName: req.ApplicationSource.TargetRevision}
+	promise := s.runManifestGen(stream.Context(), workDir, resolvedRevision, metadata.Checksum, func() (*operationContext, error) {
 		appPath, err := apppathutil.Path(workDir, req.ApplicationSource.Path)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get app path: %w", err)
@@ -672,7 +677,7 @@ type generateManifestCh struct {
 // - or, the cache does contain a value for this key, but it is an expired manifest generation entry
 // - or, NoCache is true
 // Returns a ManifestResponse, or an error, but not both
-func (s *Service) runManifestGen(ctx context.Context, repoRoot, commitSHA, cacheKey string, opContextSrc operationContextSrc, q *apiclient.ManifestRequest) *ManifestResponsePromise {
+func (s *Service) runManifestGen(ctx context.Context, repoRoot string, resolvedRevision *git.ResolvedRevision, cacheKey string, opContextSrc operationContextSrc, q *apiclient.ManifestRequest) *ManifestResponsePromise {
 	responseCh := make(chan *apiclient.ManifestResponse)
 	tarDoneCh := make(chan bool)
 	errCh := make(chan error)
@@ -683,7 +688,7 @@ func (s *Service) runManifestGen(ctx context.Context, repoRoot, commitSHA, cache
 		tarDoneCh:  tarDoneCh,
 		errCh:      errCh,
 	}
-	go s.runManifestGenAsync(ctx, repoRoot, commitSHA, cacheKey, opContextSrc, q, channels)
+	go s.runManifestGenAsync(ctx, repoRoot, resolvedRevision, cacheKey, opContextSrc, q, channels)
 	return responsePromise
 }
 
@@ -696,7 +701,8 @@ type repoRef struct {
 	key string
 }
 
-func (s *Service) runManifestGenAsync(ctx context.Context, repoRoot, commitSHA, cacheKey string, opContextSrc operationContextSrc, q *apiclient.ManifestRequest, ch *generateManifestCh) {
+func (s *Service) runManifestGenAsync(ctx context.Context, repoRoot string, resolvedRevision *git.ResolvedRevision, cacheKey string, opContextSrc operationContextSrc, q *apiclient.ManifestRequest, ch *generateManifestCh) {
+	commitSHA := resolvedRevision.ResolvedRevision
 	defer func() {
 		close(ch.errCh)
 		close(ch.responseCh)
@@ -749,12 +755,13 @@ func (s *Service) runManifestGenAsync(ctx context.Context, repoRoot, commitSHA, 
 								return
 							}
 						} else {
-							gitClient, referencedCommitSHA, err := s.newClientResolveRevision(&refSourceMapping.Repo, refSourceMapping.TargetRevision, git.WithCache(s.cache, !q.NoRevisionCache && !q.NoCache))
+							gitClient, resolvedRevision, err := s.newClientResolveRevision(&refSourceMapping.Repo, refSourceMapping.TargetRevision, git.WithCache(s.cache, !q.NoRevisionCache && !q.NoCache))
 							if err != nil {
 								log.Errorf("Failed to get git client for repo %s: %v", refSourceMapping.Repo.Repo, err)
 								ch.errCh <- fmt.Errorf("failed to get git client for repo %s", refSourceMapping.Repo.Repo)
 								return
 							}
+							referencedCommitSHA := resolvedRevision.ResolvedRevision
 
 							if git.NormalizeGitURL(q.ApplicationSource.RepoURL) == normalizedRepoURL && commitSHA != referencedCommitSHA {
 								ch.errCh <- fmt.Errorf("cannot reference a different revision of the same repository (%s references %q which resolves to %q while the application references %q which resolves to %q)", refVar, refSourceMapping.TargetRevision, referencedCommitSHA, q.Revision, commitSHA)
@@ -802,7 +809,7 @@ func (s *Service) runManifestGenAsync(ctx context.Context, repoRoot, commitSHA, 
 			}
 		}
 
-		manifestGenResult, err = GenerateManifests(ctx, opContext.appPath, repoRoot, commitSHA, q, false, s.gitCredsStore, s.initConstants.MaxCombinedDirectoryManifestsSize, s.gitRepoPaths, WithCMPTarDoneChannel(ch.tarDoneCh), WithCMPTarExcludedGlobs(s.initConstants.CMPTarExcludedGlobs), WithCMPUseManifestGeneratePaths(s.initConstants.CMPUseManifestGeneratePaths))
+		manifestGenResult, err = GenerateManifests(ctx, opContext.appPath, repoRoot, resolvedRevision, q, false, s.gitCredsStore, s.initConstants.MaxCombinedDirectoryManifestsSize, s.gitRepoPaths, WithCMPTarDoneChannel(ch.tarDoneCh), WithCMPTarExcludedGlobs(s.initConstants.CMPTarExcludedGlobs), WithCMPUseManifestGeneratePaths(s.initConstants.CMPUseManifestGeneratePaths))
 	}
 	refSourceCommitSHAs := make(map[string]string)
 	if len(repoRefs) > 0 {
@@ -1420,13 +1427,13 @@ func WithCMPUseManifestGeneratePaths(enabled bool) GenerateManifestOpt {
 }
 
 // GenerateManifests generates manifests from a path. Overrides are applied as a side effect on the given ApplicationSource.
-func GenerateManifests(ctx context.Context, appPath, repoRoot, revision string, q *apiclient.ManifestRequest, isLocal bool, gitCredsStore git.CredsStore, maxCombinedManifestQuantity resource.Quantity, gitRepoPaths io.TempPaths, opts ...GenerateManifestOpt) (*apiclient.ManifestResponse, error) {
+func GenerateManifests(ctx context.Context, appPath string, repoRoot string, resolvedRevision *git.ResolvedRevision, q *apiclient.ManifestRequest, isLocal bool, gitCredsStore git.CredsStore, maxCombinedManifestQuantity resource.Quantity, gitRepoPaths io.TempPaths, opts ...GenerateManifestOpt) (*apiclient.ManifestResponse, error) {
 	opt := newGenerateManifestOpt(opts...)
 	var targetObjs []*unstructured.Unstructured
 
 	resourceTracking := argo.NewResourceTracking()
 
-	env := newEnv(q, revision)
+	env := newEnv(q, resolvedRevision)
 
 	appSourceType, err := GetAppSourceType(ctx, q.ApplicationSource, appPath, repoRoot, q.AppName, q.EnabledSourceTypes, opt.cmpTarExcludedGlobs, env.Environ())
 	if err != nil {
@@ -1524,19 +1531,20 @@ func GenerateManifests(ctx context.Context, appPath, repoRoot, revision string, 
 	}, nil
 }
 
-func newEnv(q *apiclient.ManifestRequest, revision string) *v1alpha1.Env {
-	shortRevision := shortenRevision(revision, 7)
-	shortRevision8 := shortenRevision(revision, 8)
+func newEnv(q *apiclient.ManifestRequest, resolvedRevision *git.ResolvedRevision) *v1alpha1.Env {
+	shortRevision := shortenRevision(resolvedRevision.ResolvedRevision, 7)
+	shortRevision8 := shortenRevision(resolvedRevision.ResolvedRevision, 8)
 	return &v1alpha1.Env{
 		&v1alpha1.EnvEntry{Name: "ARGOCD_APP_NAME", Value: q.AppName},
 		&v1alpha1.EnvEntry{Name: "ARGOCD_APP_NAMESPACE", Value: q.Namespace},
 		&v1alpha1.EnvEntry{Name: "ARGOCD_APP_PROJECT_NAME", Value: q.ProjectName},
-		&v1alpha1.EnvEntry{Name: "ARGOCD_APP_REVISION", Value: revision},
+		&v1alpha1.EnvEntry{Name: "ARGOCD_APP_REVISION", Value: resolvedRevision.ResolvedRevision},
 		&v1alpha1.EnvEntry{Name: "ARGOCD_APP_REVISION_SHORT", Value: shortRevision},
 		&v1alpha1.EnvEntry{Name: "ARGOCD_APP_REVISION_SHORT_8", Value: shortRevision8},
 		&v1alpha1.EnvEntry{Name: "ARGOCD_APP_SOURCE_REPO_URL", Value: q.Repo.Repo},
 		&v1alpha1.EnvEntry{Name: "ARGOCD_APP_SOURCE_PATH", Value: q.ApplicationSource.Path},
 		&v1alpha1.EnvEntry{Name: "ARGOCD_APP_SOURCE_TARGET_REVISION", Value: q.ApplicationSource.TargetRevision},
+		&v1alpha1.EnvEntry{Name: "ARGOCD_APP_SOURCE_TARGET_REVISION_RESOLVED", Value: resolvedRevision.ResolvedRevisionName},
 	}
 }
 
@@ -2062,7 +2070,7 @@ func (s *Service) GetAppDetails(ctx context.Context, q *apiclient.RepoServerAppD
 	res := &apiclient.RepoAppDetailsResponse{}
 
 	cacheFn := s.createGetAppDetailsCacheHandler(res, q)
-	operation := func(repoRoot, commitSHA, revision string, ctxSrc operationContextSrc) error {
+	operation := func(repoRoot string, resolvedRevision *git.ResolvedRevision, revision string, ctxSrc operationContextSrc) error {
 		opContext, err := ctxSrc()
 		if err != nil {
 			return err
@@ -2083,7 +2091,7 @@ func (s *Service) GetAppDetails(ctx context.Context, q *apiclient.RepoServerAppD
 				return err
 			}
 		case v1alpha1.ApplicationSourceTypeKustomize:
-			if err := populateKustomizeAppDetails(res, q, repoRoot, opContext.appPath, commitSHA, s.gitCredsStore); err != nil {
+			if err := populateKustomizeAppDetails(res, q, repoRoot, opContext.appPath, resolvedRevision, s.gitCredsStore); err != nil {
 				return err
 			}
 		case v1alpha1.ApplicationSourceTypePlugin:
@@ -2219,7 +2227,7 @@ func walkHelmValueFilesInPath(root string, valueFiles *[]string) filepath.WalkFu
 	}
 }
 
-func populateKustomizeAppDetails(res *apiclient.RepoAppDetailsResponse, q *apiclient.RepoServerAppDetailsQuery, repoRoot string, appPath string, reversion string, credsStore git.CredsStore) error {
+func populateKustomizeAppDetails(res *apiclient.RepoAppDetailsResponse, q *apiclient.RepoServerAppDetailsQuery, repoRoot string, appPath string, reversion *git.ResolvedRevision, credsStore git.CredsStore) error {
 	res.Kustomize = &apiclient.KustomizeAppSpec{}
 	kustomizeBinary := ""
 	if q.KustomizeOptions != nil {
@@ -2423,15 +2431,15 @@ func (s *Service) newClient(repo *v1alpha1.Repository, opts ...git.ClientOpts) (
 
 // newClientResolveRevision is a helper to perform the common task of instantiating a git client
 // and resolving a revision to a commit SHA
-func (s *Service) newClientResolveRevision(repo *v1alpha1.Repository, revision string, opts ...git.ClientOpts) (git.Client, string, error) {
+func (s *Service) newClientResolveRevision(repo *v1alpha1.Repository, revision string, opts ...git.ClientOpts) (git.Client, *git.ResolvedRevision, error) {
 	gitClient, err := s.newClient(repo, opts...)
 	if err != nil {
-		return nil, "", err
+		return nil, nil, err
 	}
 	commitSHA, err := gitClient.LsRemote(revision)
 	if err != nil {
 		s.metricsServer.IncGitLsRemoteFail(gitClient.Root(), revision)
-		return nil, "", err
+		return nil, nil, err
 	}
 	return gitClient, commitSHA, nil
 }
@@ -2619,7 +2627,9 @@ func (s *Service) ResolveRevision(_ context.Context, q *apiclient.ResolveRevisio
 	if err != nil {
 		return &apiclient.ResolveRevisionResponse{Revision: "", AmbiguousRevision: ""}, err
 	}
-	revision, err = gitClient.LsRemote(ambiguousRevision)
+	var resolvedRevision *git.ResolvedRevision
+	resolvedRevision, err = gitClient.LsRemote(ambiguousRevision)
+	revision = resolvedRevision.ResolvedRevision
 	if err != nil {
 		s.metricsServer.IncGitLsRemoteFail(gitClient.Root(), revision)
 		return &apiclient.ResolveRevisionResponse{Revision: "", AmbiguousRevision: ""}, err
@@ -2644,7 +2654,9 @@ func (s *Service) GetGitFiles(_ context.Context, request *apiclient.GitFilesRequ
 		return nil, status.Error(codes.InvalidArgument, "must pass a valid repo")
 	}
 
-	gitClient, revision, err := s.newClientResolveRevision(repo, revision, git.WithCache(s.cache, !noRevisionCache))
+	var resolvedRevision *git.ResolvedRevision
+	gitClient, resolvedRevision, err := s.newClientResolveRevision(repo, revision, git.WithCache(s.cache, !noRevisionCache))
+	revision = resolvedRevision.ResolvedRevision
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "unable to resolve git revision %s: %v", revision, err)
 	}
@@ -2726,7 +2738,9 @@ func (s *Service) GetGitDirectories(_ context.Context, request *apiclient.GitDir
 		return nil, status.Error(codes.InvalidArgument, "must pass a valid repo")
 	}
 
-	gitClient, revision, err := s.newClientResolveRevision(repo, revision, git.WithCache(s.cache, !noRevisionCache))
+	var resolvedRevision *git.ResolvedRevision
+	gitClient, resolvedRevision, err := s.newClientResolveRevision(repo, revision, git.WithCache(s.cache, !noRevisionCache))
+	revision = resolvedRevision.ResolvedRevision
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "unable to resolve git revision %s: %v", revision, err)
 	}
@@ -2818,12 +2832,16 @@ func (s *Service) UpdateRevisionForPaths(_ context.Context, request *apiclient.U
 	}
 
 	gitClientOpts := git.WithCache(s.cache, !request.NoRevisionCache)
-	gitClient, revision, err := s.newClientResolveRevision(repo, revision, gitClientOpts)
+	var resolvedRevision *git.ResolvedRevision
+	gitClient, resolvedRevision, err := s.newClientResolveRevision(repo, revision, gitClientOpts)
+	revision = resolvedRevision.ResolvedRevision
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "unable to resolve git revision %s: %v", revision, err)
 	}
 
-	syncedRevision, err = gitClient.LsRemote(syncedRevision)
+	var resolvedSyncedRevision *git.ResolvedRevision
+	resolvedSyncedRevision, err = gitClient.LsRemote(syncedRevision)
+	syncedRevision = resolvedSyncedRevision.ResolvedRevision
 	if err != nil {
 		s.metricsServer.IncGitLsRemoteFail(gitClient.Root(), revision)
 		return nil, status.Errorf(codes.Internal, "unable to resolve git revision %s: %v", revision, err)

@@ -1158,7 +1158,8 @@ func getLocalObjectsString(ctx context.Context, app *argoappv1.Application, proj
 	trackingMethod string,
 ) []string {
 	source := app.Spec.GetSource()
-	res, err := repository.GenerateManifests(ctx, local, localRepoRoot, source.TargetRevision, &repoapiclient.ManifestRequest{
+	resolvedRevision := &git.ResolvedRevision{ResolvedRevision: source.TargetRevision, ResolvedRevisionName: source.TargetRevision}
+	res, err := repository.GenerateManifests(ctx, local, localRepoRoot, resolvedRevision, &repoapiclient.ManifestRequest{
 		Repo:                            &argoappv1.Repository{Repo: source.RepoURL},
 		AppLabelKey:                     appLabelKey,
 		AppName:                         app.Name,

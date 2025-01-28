@@ -345,22 +345,24 @@ func (_m *Client) LsRefs() (*git.Refs, error) {
 }
 
 // LsRemote provides a mock function with given fields: revision
-func (_m *Client) LsRemote(revision string) (string, error) {
+func (_m *Client) LsRemote(revision string) (*git.ResolvedRevision, error) {
 	ret := _m.Called(revision)
 
 	if len(ret) == 0 {
 		panic("no return value specified for LsRemote")
 	}
 
-	var r0 string
+	var r0 *git.ResolvedRevision
 	var r1 error
-	if rf, ok := ret.Get(0).(func(string) (string, error)); ok {
+	if rf, ok := ret.Get(0).(func(string) (*git.ResolvedRevision, error)); ok {
 		return rf(revision)
 	}
-	if rf, ok := ret.Get(0).(func(string) string); ok {
+	if rf, ok := ret.Get(0).(func(string) *git.ResolvedRevision); ok {
 		r0 = rf(revision)
 	} else {
-		r0 = ret.Get(0).(string)
+		if ret.Get(0) != nil {
+			r0 = ret.Get(0).(*git.ResolvedRevision)
+		}
 	}
 
 	if rf, ok := ret.Get(1).(func(string) error); ok {

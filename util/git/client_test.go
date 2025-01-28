@@ -159,11 +159,13 @@ func Test_ChangedFiles(t *testing.T) {
 	err = runCmd(client.Root(), "git", "commit", "-m", "Changes", "-a")
 	require.NoError(t, err)
 
-	previousSHA, err := client.LsRemote("some-tag")
+	resolvedPreviousRevision, err := client.LsRemote("some-tag")
 	require.NoError(t, err)
+	previousSHA := resolvedPreviousRevision.ResolvedRevision
 
-	commitSHA, err := client.LsRemote("HEAD")
+	resolvedHeadRevision, err := client.LsRemote("HEAD")
 	require.NoError(t, err)
+	commitSHA := resolvedHeadRevision.ResolvedRevision
 
 	// Invalid commits, error
 	_, err = client.ChangedFiles("0000000000000000000000000000000000000000", "1111111111111111111111111111111111111111")
@@ -211,8 +213,9 @@ func Test_SemverTags(t *testing.T) {
 		err = runCmd(client.Root(), "git", "tag", tag)
 		require.NoError(t, err)
 
-		sha, err := client.LsRemote("HEAD")
+		resolvedRevision, err := client.LsRemote("HEAD")
 		require.NoError(t, err)
+		sha := resolvedRevision.ResolvedRevision
 
 		mapTagRefs[tag] = sha
 	}
@@ -314,11 +317,12 @@ func Test_SemverTags(t *testing.T) {
 		expected: mapTagRefs["2024-banana"],
 	}} {
 		t.Run(tc.name, func(t *testing.T) {
-			commitSHA, err := client.LsRemote(tc.ref)
+			resolvedRevision, err := client.LsRemote(tc.ref)
 			if tc.error {
 				require.Error(t, err)
 				return
 			}
+			commitSHA := resolvedRevision.ResolvedRevision
 			require.NoError(t, err)
 			assert.True(t, IsCommitSHA(commitSHA))
 			assert.Equal(t, tc.expected, commitSHA)
@@ -371,8 +375,9 @@ func Test_nativeGitClient_Submodule(t *testing.T) {
 	err = client.Fetch("")
 	require.NoError(t, err)
 
-	commitSHA, err := client.LsRemote("HEAD")
+	resolvedRevision, err := client.LsRemote("HEAD")
 	require.NoError(t, err)
+	commitSHA := resolvedRevision.ResolvedRevision
 
 	// Call Checkout() with submoduleEnabled=false.
 	_, err = client.Checkout(commitSHA, false)
@@ -438,8 +443,9 @@ func Test_IsRevisionPresent(t *testing.T) {
 	err = runCmd(client.Root(), "git", "commit", "-m", "Initial Commit", "-a")
 	require.NoError(t, err)
 
-	commitSHA, err := client.LsRemote("HEAD")
+	resolvedRevision, err := client.LsRemote("HEAD")
 	require.NoError(t, err)
+	commitSHA := resolvedRevision.ResolvedRevision
 
 	// Ensure revision for HEAD is present locally.
 	revisionPresent := client.IsRevisionPresent(commitSHA)

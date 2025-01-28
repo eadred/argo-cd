@@ -268,8 +268,9 @@ func TestLsRemote(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			commitSHA, err := clnt.LsRemote(tc.revision)
+			resolvedRevision, err := clnt.LsRemote(tc.revision)
 			require.NoError(t, err)
+			commitSHA := resolvedRevision.ResolvedRevision
 			assert.True(t, IsCommitSHA(commitSHA))
 			if tc.expectedCommit != "" {
 				assert.Equal(t, tc.expectedCommit, commitSHA)
@@ -279,8 +280,9 @@ func TestLsRemote(t *testing.T) {
 
 	// We do not resolve truncated git hashes and return the commit as-is if it appears to be a commit
 	t.Run("truncated commit", func(t *testing.T) {
-		commitSHA, err := clnt.LsRemote("4e22a3c")
+		resolvedRevision, err := clnt.LsRemote("4e22a3c")
 		require.NoError(t, err)
+		commitSHA := resolvedRevision.ResolvedRevision
 		assert.False(t, IsCommitSHA(commitSHA))
 		assert.True(t, IsTruncatedCommitSHA(commitSHA))
 	})
@@ -309,8 +311,9 @@ func TestLFSClient(t *testing.T) {
 	client, err := NewClientExt("https://github.com/argoproj-labs/argocd-testrepo-lfs", tempDir, NopCreds{}, false, true, "", "")
 	require.NoError(t, err)
 
-	commitSHA, err := client.LsRemote("HEAD")
+	resolvedRevision, err := client.LsRemote("HEAD")
 	require.NoError(t, err)
+	commitSHA := resolvedRevision.ResolvedRevision
 	assert.NotEqual(t, "", commitSHA)
 
 	err = client.Init()
@@ -354,8 +357,9 @@ func TestVerifyCommitSignature(t *testing.T) {
 	err = client.Fetch("")
 	require.NoError(t, err)
 
-	commitSHA, err := client.LsRemote("HEAD")
+	resolvedRevision, err := client.LsRemote("HEAD")
 	require.NoError(t, err)
+	commitSHA := resolvedRevision.ResolvedRevision
 
 	_, err = client.Checkout(commitSHA, true)
 	require.NoError(t, err)
@@ -401,8 +405,9 @@ func TestNewFactory(t *testing.T) {
 
 		client, err := NewClientExt(tt.args.url, dirName, NopCreds{}, tt.args.insecureIgnoreHostKey, false, "", "")
 		require.NoError(t, err)
-		commitSHA, err := client.LsRemote("HEAD")
+		resolvedRevision, err := client.LsRemote("HEAD")
 		require.NoError(t, err)
+		commitSHA := resolvedRevision.ResolvedRevision
 
 		err = client.Init()
 		require.NoError(t, err)
